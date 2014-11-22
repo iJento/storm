@@ -23,11 +23,9 @@ import backtype.storm.metric.api.CountMetric;
 import backtype.storm.metric.api.MeanReducer;
 import backtype.storm.metric.api.ReducedMetric;
 import backtype.storm.spout.SpoutOutputCollector;
-import backtype.storm.utils.Utils;
 import com.google.common.collect.ImmutableMap;
 import kafka.javaapi.consumer.SimpleConsumer;
 import kafka.javaapi.message.ByteBufferMessageSet;
-import kafka.message.ByteBufferMessageSet$;
 import kafka.message.MessageAndOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,13 +37,17 @@ import java.util.*;
 
 public class PartitionManager {
     public static final Logger LOG = LoggerFactory.getLogger(PartitionManager.class);
+
     private final CombinedMetric _fetchAPILatencyMax;
     private final ReducedMetric _fetchAPILatencyMean;
     private final CountMetric _fetchAPICallCount;
     private final CountMetric _fetchAPIMessageCount;
     Long _emittedToOffset;
-    SortedSet<Long> _pending = new TreeSet<Long>();
-    SortedSet<Long> failed = new TreeSet<Long>();
+    // _pending key = Kafka offset, value = time at which the message was first submitted to the topology
+    private SortedMap<Long,Long> _pending = new TreeMap<Long,Long>();
+    private final FailedMsgRetryManager _failedMsgRetryManager;
+
+    // retryRecords key = Kafka offset, value = retry info for the given message
     Long _committedTo;
     LinkedList<MessageAndRealOffset> _waitingToEmit = new LinkedList<MessageAndRealOffset>();
     Partition _partition;
@@ -65,6 +67,10 @@ public class PartitionManager {
         _state = state;
         _stormConf = stormConf;
         numberAcked = numberFailed = 0;
+
+        _failedMsgRetryManager = new ExponentialBackoffMsgRetryManager(_spoutConfig.retryInitialDelayMs,
+                                                                           _spoutConfig.retryDelayMultiplier,
+                                                                           _spoutConfig.retryDelayMaxMs);
 
         String jsonTopologyId = null;
         Long jsonOffset = null;
@@ -145,15 +151,15 @@ public class PartitionManager {
         }
     }
 
+
     private void fill() {
         long start = System.nanoTime();
-        long offset;
-        final boolean had_failed = !failed.isEmpty();
+        Long offset;
 
         // Are there failed tuples? If so, fetch those first.
-        if (had_failed) {
-            offset = failed.first();
-        } else {
+        offset = this._failedMsgRetryManager.nextFailedMessageToRetry();
+        final boolean processingNewTuples = (offset == null);
+        if (processingNewTuples) {
             offset = _emittedToOffset;
         }
 
@@ -166,18 +172,11 @@ public class PartitionManager {
             // fetch failed, so don't update the metrics
 
             //fix bug [STORM-643] : remove outdated failed offsets
-            if (had_failed) {
+            if (!processingNewTuples) {
                 // For the case of EarliestTime it would be better to discard
                 // all the failed offsets, that are earlier than actual EarliestTime
                 // offset, since they are anyway not there.
                 // These calls to broker API will be then saved.
-
-                // In case of LatestTime - it is a question, if we still need to try out and
-                // reach those that are failed (they still may be available).
-                // But, by moving to LatestTime we are discarding messages in kafka queue.
-                // Since it is configured so, assume that it is ok for user to loose information
-                // and user cares about newest messages first.
-                // It makes sense not to do exceptions for those that are failed and discard them as well.
 
                 SortedSet<Long> omitted = failed.headSet(_emittedToOffset);
 
@@ -205,13 +204,15 @@ public class PartitionManager {
                     // Skip any old offsets.
                     continue;
                 }
-                if (!had_failed || failed.contains(cur_offset)) {
+                if (processingNewTuples || this._failedMsgRetryManager.shouldRetryMsg(cur_offset)) {
                     numMessages += 1;
-                    _pending.add(cur_offset);
+                    if (!_pending.containsKey(cur_offset)) {
+                        _pending.put(cur_offset, System.currentTimeMillis());
+                    }
                     _waitingToEmit.add(new MessageAndRealOffset(msg.message(), cur_offset));
                     _emittedToOffset = Math.max(msg.nextOffset(), _emittedToOffset);
-                    if (had_failed) {
-                        failed.remove(cur_offset);
+                    if (_failedMsgRetryManager.shouldRetryMsg(cur_offset)) {
+                        this._failedMsgRetryManager.retryStarted(cur_offset);
                     }
                 }
             }
@@ -220,11 +221,12 @@ public class PartitionManager {
     }
 
     public void ack(Long offset) {
-        if (!_pending.isEmpty() && _pending.first() < offset - _spoutConfig.maxOffsetBehind) {
+        if (!_pending.isEmpty() && _pending.firstKey() < offset - _spoutConfig.maxOffsetBehind) {
             // Too many things pending!
-            _pending.headSet(offset - _spoutConfig.maxOffsetBehind).clear();
+            _pending.headMap(offset - _spoutConfig.maxOffsetBehind).clear();
         }
         _pending.remove(offset);
+        this._failedMsgRetryManager.acked(offset);
         numberAcked++;
     }
 
@@ -237,11 +239,12 @@ public class PartitionManager {
             );
         } else {
             LOG.debug("failing at offset=" + offset + " with _pending.size()=" + _pending.size() + " pending and _emittedToOffset=" + _emittedToOffset);
-            failed.add(offset);
             numberFailed++;
             if (numberAcked == 0 && numberFailed > _spoutConfig.maxOffsetBehind) {
                 throw new RuntimeException("Too many tuple failures");
             }
+
+            this._failedMsgRetryManager.failed(offset);
         }
     }
 
@@ -274,7 +277,7 @@ public class PartitionManager {
         if (_pending.isEmpty()) {
             return _emittedToOffset;
         } else {
-            return _pending.first();
+            return _pending.firstKey();
         }
     }
 
