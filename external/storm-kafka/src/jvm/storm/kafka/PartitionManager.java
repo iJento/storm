@@ -178,13 +178,7 @@ public class PartitionManager {
                 // offset, since they are anyway not there.
                 // These calls to broker API will be then saved.
 
-                SortedSet<Long> omitted = failed.headSet(_emittedToOffset);
-
-                // Use tail, since sortedSet maintains its elements in ascending order
-                // Using tailSet will set a 'range' on original implementation
-                // so we couldn't then add objects that are out of range.
-                // For that reason we copy tail into new Set, where range is not set.
-                failed = new TreeSet<Long>(failed.tailSet(_emittedToOffset));
+                Set<Long> omitted = this._failedMsgRetryManager.clearInvalidMessages(_emittedToOffset);
                 LOG.warn("Removing the failed offsets that are out of range: {}", omitted);
             }
 
